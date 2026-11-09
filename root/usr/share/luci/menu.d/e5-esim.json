@@ -1,0 +1,8 @@
+{
+  "admin/modem/esim": {
+    "title": "eSIM 管理",
+    "order": 1,
+    "action": {"type": "view", "path": "e5-esim"},
+    "depends": {"acl": ["luci-app-e5-esim"]}
+  }
+}

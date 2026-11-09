@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  SDK_URL: https://downloads.openwrt.org/releases/25.12.5/targets/armsr/armv8/openwrt-sdk-25.12.5-armsr-armv8_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+  SDK_SHA256: 1b0316604a3e820b2b008a1baff3f9dac6716af942bef800930e58c7de98c98b
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd build-essential rsync file gawk python3 libncurses-dev git unzip wget
+
+      - name: Fetch OpenWrt SDK
+        run: |
+          curl --fail --location --retry 5 --proto '=https' --proto-redir '=https' \
+            --output "$RUNNER_TEMP/sdk.tar.zst" "$SDK_URL"
+          echo "$SDK_SHA256  $RUNNER_TEMP/sdk.tar.zst" | sha256sum -c -
+
+      - name: Build package
+        run: |
+          mkdir "$RUNNER_TEMP/sdk"
+          tar --zstd -xf "$RUNNER_TEMP/sdk.tar.zst" -C "$RUNNER_TEMP/sdk" --strip-components=1
+          rsync -a --exclude .git ./ "$RUNNER_TEMP/sdk/package/luci-app-e5-esim/"
+          make -C "$RUNNER_TEMP/sdk" defconfig
+          make -C "$RUNNER_TEMP/sdk" package/luci-app-e5-esim/compile V=s
+          cp "$RUNNER_TEMP"/sdk/bin/packages/*/*/luci-app-e5-esim-*.apk .
+          echo "PACKAGE=$(ls luci-app-e5-esim-*.apk)" >> "$GITHUB_ENV"
+
+      - name: Release
+        working-directory: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}" "$PACKAGE" \
+            --target "$GITHUB_SHA" \
+            --title "Build ${{ github.run_number }} (${GITHUB_SHA::7})" \
+            --notes "$(git log -1 --format=%B)"

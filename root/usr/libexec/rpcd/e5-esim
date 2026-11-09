@@ -1,0 +1,328 @@
+#!/usr/bin/python3
+import fcntl
+import json
+import os
+import signal
+import subprocess
+import sys
+
+sys.path.insert(0, '/usr/lib/e5-esim')
+import bridge
+
+STATE_DIR = '/tmp/e5-esim'
+STATUS = os.path.join(STATE_DIR, 'job.json')
+PIDFILE = os.path.join(STATE_DIR, 'job.pid')
+FIFO = os.path.join(STATE_DIR, 'job.in')
+LOCK = os.path.join(STATE_DIR, 'lock')
+JOB = '/usr/lib/e5-esim/job.py'
+SE_AIDS = ('A06573746B6D65FFFF4953442D522030', 'A06573746B6D65FFFF4953442D522031')
+
+EMPTY = {'type': None, 'state': None, 'step': None, 'preview': False, 'metadata': None,
+         'error': None, 'detail': None}
+
+METHODS = {
+    'snapshot': {'slot': 0, 'aid': '', 'scan': True},
+    'profiles': {'slot': 0, 'aid': ''},
+    'notifications': {'slot': 0, 'aid': ''},
+    'profile_state': {'slot': 0, 'iccid': '', 'enabled': False, 'aid': ''},
+    'nickname': {'slot': 0, 'iccid': '', 'name': '', 'aid': ''},
+    'delete': {'slot': 0, 'iccid': '', 'aid': ''},
+    'sim_refresh': {'slot': 0},
+    'notification_process': {'slot': 0, 'seq': 0, 'aid': ''},
+    'notification_remove': {'slot': 0, 'seq': 0, 'aid': ''},
+    'download_start': {'slot': 0, 'activation': '', 'confirmation': '', 'aid': ''},
+    'operation_start': {'slot': 0, 'request': '', 'aid': ''},
+    'job_status': {},
+    'job_confirm': {'accept': False},
+    'job_cancel': {},
+}
+
+LOCKED = {'snapshot', 'profiles', 'notifications', 'profile_state', 'nickname', 'delete', 'sim_refresh',
+          'notification_process', 'notification_remove'}
+
+
+class Invalid(Exception):
+    pass
+
+
+class Busy(Exception):
+    pass
+
+
+def write_status(status):
+    path = STATUS + '.tmp'
+    with open(path, 'w') as file:
+        json.dump(status, file)
+    os.replace(path, STATUS)
+
+
+def ok(data=None):
+    return {'ok': True, 'data': data, 'error': None, 'detail': None}
+
+
+def failure(error, detail):
+    return {'ok': False, 'data': None, 'error': error, 'detail': detail}
+
+
+def clean_text(text):
+    cleaned = ''.join(char for char in text if char >= ' ' and char != '\x7f')
+    return cleaned.strip(' ')
+
+
+def slot_of(params):
+    slot = params.get('slot')
+    if type(slot) is not int or slot not in (0, 1):
+        raise Invalid('slot')
+    return slot
+
+
+def seq_of(params):
+    seq = params.get('seq')
+    if type(seq) is not int or not 0 <= seq <= 0xffffffff:
+        raise Invalid('seq')
+    return seq
+
+
+def aid_of(params):
+    aid = params.get('aid', '')
+    if not isinstance(aid, str) or (aid and aid not in SE_AIDS):
+        raise Invalid('aid')
+    return aid
+
+
+def acquire():
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    fd = os.open(LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise Busy()
+    return fd
+
+
+def spawn(argv):
+    fd = acquire()
+    try:
+        try:
+            os.mkfifo(FIFO)
+        except FileExistsError:
+            pass
+        proc = subprocess.Popen([sys.executable, JOB] + argv, pass_fds=(fd,), start_new_session=True,
+                               stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+        with open(PIDFILE, 'w') as file:
+            file.write(str(proc.pid))
+        status = dict(EMPTY, type=argv[0], state='running', slot=int(argv[1]), aid=argv[-1])
+        if argv[0] == 'operation':
+            status['action'] = json.loads(argv[2])['action']
+        write_status(status)
+        proc.stdin.write(b'1')
+        proc.stdin.close()
+    finally:
+        os.close(fd)
+    return ok()
+
+
+def alive():
+    try:
+        with open(PIDFILE) as file:
+            pid = int(file.read().strip())
+        os.kill(pid, 0)
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def snapshot(params):
+    slot = slot_of(params)
+    aid = aid_of(params)
+    scan = params.get('scan', True)
+    if type(scan) is not bool:
+        raise Invalid('scan')
+    chip = bridge.run_lpac(slot, ['chip', 'info'], aid=aid)
+    if not chip['ok']:
+        return {'ok': False, 'chip': chip, 'profiles': None, 'notifications': None,
+                'error': chip['error'], 'detail': chip['detail'], 'aid': aid}
+    chosen = aid
+    ses = 0
+    if scan and bridge.probe_estk(slot):
+        first = None
+        for index, candidate in enumerate(SE_AIDS):
+            # Reuse the initial read when the request already selected this SE.
+            result = chip if candidate == aid else bridge.run_lpac(slot, ['chip', 'info'], aid=candidate)
+            data = result['data']
+            if (result['ok'] and isinstance(data, dict) and data.get('eidValue') and
+                    isinstance(data.get('EUICCInfo2'), dict)):
+                ses |= 1 << index
+                if first is None:
+                    first = (candidate, result)
+        if ses and not aid:
+            chosen = first[0]
+            chip = first[1]
+    result = {'ok': True, 'chip': chip,
+              'profiles': bridge.run_lpac(slot, ['profile', 'list'], aid=chosen),
+              'notifications': bridge.run_lpac(slot, ['notification', 'list'], aid=chosen),
+              'error': None, 'detail': None, 'aid': chosen}
+    if scan:
+        result['ses'] = ses
+    return result
+
+
+def notifications(params):
+    return bridge.run_lpac(slot_of(params), ['notification', 'list'], aid=aid_of(params))
+
+
+def profiles(params):
+    return bridge.run_lpac(slot_of(params), ['profile', 'list'], aid=aid_of(params))
+
+
+def profile_state(params):
+    slot = slot_of(params)
+    action = 'enable' if params.get('enabled') else 'disable'
+    return bridge.run_lpac(slot, ['profile', action, str(params.get('iccid') or '')], aid=aid_of(params))
+
+
+def nickname(params):
+    slot = slot_of(params)
+    name = clean_text(str(params.get('name') or ''))
+    return bridge.run_lpac(slot, ['profile', 'nickname', str(params.get('iccid') or ''), name], aid=aid_of(params))
+
+
+def delete(params):
+    return bridge.run_lpac(slot_of(params), ['profile', 'delete', str(params.get('iccid') or '')], aid=aid_of(params))
+
+
+def sim_refresh(params):
+    if bridge.sim_refresh(slot_of(params)):
+        return ok()
+    return failure('refresh', '')
+
+
+def notification_process(params):
+    slot = slot_of(params)
+    return bridge.run_lpac(slot, ['notification', 'process', '-r', str(seq_of(params))], aid=aid_of(params))
+
+
+def notification_remove(params):
+    slot = slot_of(params)
+    return bridge.run_lpac(slot, ['notification', 'remove', str(seq_of(params))], aid=aid_of(params))
+
+
+def download_start(params):
+    activation = clean_text(str(params.get('activation') or ''))
+    if not activation:
+        return failure('activation_code', '')
+    slot = slot_of(params)
+    confirmation = clean_text(str(params.get('confirmation') or ''))
+    return spawn(['download', str(slot), activation, confirmation, aid_of(params)])
+
+
+def operation_start(params):
+    slot = slot_of(params)
+    aid = aid_of(params)
+    request = json.loads(params.get('request', '{}'))
+    if not isinstance(request, dict):
+        raise Invalid('request')
+    action = request.get('action')
+    if action in ('switch', 'rename', 'delete'):
+        if not isinstance(request.get('iccid'), str):
+            raise Invalid('iccid')
+        if action == 'switch' and type(request.get('enabled')) is not bool:
+            raise Invalid('enabled')
+        if action == 'rename':
+            if not isinstance(request.get('name'), str):
+                raise Invalid('name')
+            request['name'] = clean_text(request['name'])
+    elif action == 'notifications':
+        if type(request.get('remove')) is not bool or not isinstance(request.get('notifications'), list):
+            raise Invalid('notifications')
+        if request.get('single') and len(request['notifications']) != 1:
+            raise Invalid('notifications')
+        for item in request['notifications']:
+            if not isinstance(item, dict):
+                raise Invalid('seq')
+            seq_of({'seq': item.get('seqNumber')})
+    else:
+        raise Invalid('action')
+    return spawn(['operation', str(slot), json.dumps(request), aid])
+
+
+def job_status(params):
+    status = dict(EMPTY)
+    try:
+        with open(STATUS) as file:
+            status.update(json.load(file))
+    except OSError:
+        pass
+    status['running'] = alive()
+    return status
+
+
+def job_confirm(params):
+    try:
+        fd = os.open(FIFO, os.O_WRONLY | os.O_NONBLOCK)
+    except OSError:
+        return failure('busy', '')
+    try:
+        os.write(fd, b'y' if params.get('accept') else b'n')
+    finally:
+        os.close(fd)
+    return ok()
+
+
+def job_cancel(params):
+    try:
+        with open(PIDFILE) as file:
+            pid = int(file.read().strip())
+        os.kill(pid, signal.SIGINT)
+    except (OSError, ValueError):
+        return failure(None, None)
+    return ok()
+
+
+HANDLERS = {
+    'snapshot': snapshot,
+    'profiles': profiles,
+    'notifications': notifications,
+    'profile_state': profile_state,
+    'nickname': nickname,
+    'delete': delete,
+    'sim_refresh': sim_refresh,
+    'notification_process': notification_process,
+    'notification_remove': notification_remove,
+    'download_start': download_start,
+    'operation_start': operation_start,
+    'job_status': job_status,
+    'job_confirm': job_confirm,
+    'job_cancel': job_cancel,
+}
+
+
+def dispatch(method, params):
+    handler = HANDLERS.get(method)
+    if handler is None:
+        raise Invalid(method)
+    if method not in LOCKED:
+        return handler(params)
+    fd = acquire()
+    try:
+        return handler(params)
+    finally:
+        os.close(fd)
+
+
+if sys.argv[1:] == ['list']:
+    print(json.dumps(METHODS))
+elif len(sys.argv) == 3 and sys.argv[1] == 'call':
+    try:
+        arguments = json.loads(sys.stdin.read(24001) or '{}')
+        if not isinstance(arguments, dict):
+            raise Invalid('params')
+        print(json.dumps(dispatch(sys.argv[2], arguments)))
+    except Invalid as error:
+        print(json.dumps(failure('invalid', str(error))))
+    except Busy:
+        print(json.dumps(failure('busy', '')))
+    except Exception as error:
+        print(json.dumps(failure('lpac', str(error))))

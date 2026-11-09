@@ -1,0 +1,17 @@
+{
+  "luci-app-e5-esim": {
+    "description": "Read and manage the eSIM profiles on both SIM slots",
+    "read": {
+      "ubus": {
+        "e5-esim": ["snapshot", "profiles", "notifications", "job_status"]
+      }
+    },
+    "write": {
+      "ubus": {
+        "e5-esim": ["profile_state", "nickname", "delete", "sim_refresh",
+                    "notification_process", "notification_remove",
+                    "download_start", "operation_start", "job_confirm", "job_cancel"]
+      }
+    }
+  }
+}
