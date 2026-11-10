@@ -844,15 +844,7 @@ function createPage(loaded) {
 		stopPoll();
 		callJobStatus().then(function(job) {
 			if (state.disposed || !state.downloading) return;
-			if (!job || typeof job.running !== 'boolean') {
-				showDownloadRecovery();
-				return;
-			}
-			if (job.running) {
-				if (!matchingDownload(job)) {
-					showDownloadRecovery(new Error(tr('另一个任务正在运行，请稍后重新查询。', 'Another task is running. Check again later.')));
-					return;
-				}
+			if (job && job.running && matchingDownload(job)) {
 				state.downloadStarted = true;
 				state.needsStatus = false;
 				if (state.cancelling) sendDownloadCancel();
@@ -861,6 +853,10 @@ function createPage(loaded) {
 					previewShown = false;
 					watchDownload();
 				}
+				return;
+			}
+			if (job && job.running) {
+				showDownloadRecovery(new Error(tr('另一个任务正在运行，请稍后重新查询。', 'Another task is running. Check again later.')));
 				return;
 			}
 			if (state.downloadStarted && matchingDownload(job)) {
@@ -875,7 +871,7 @@ function createPage(loaded) {
 		stopPoll();
 		var failures = 0;
 		poll(function(job) {
-			if (!job || typeof job.running !== 'boolean' || !matchingDownload(job)) {
+			if (!matchingDownload(job)) {
 				showDownloadRecovery();
 				return false;
 			}

@@ -373,7 +373,7 @@ class BridgeFlows(unittest.TestCase):
         requests = []
         replies = iter([{'ok': True}, bridge.failed(),
                         {'ok': True, 'data': [{'iccid': '123', 'profileState': 'enabled'}]}])
-        def run(slot, argv, aid=''):
+        def run(slot, argv, aid='', **kwargs):
             requests.append(argv)
             return next(replies)
         with patch.object(bridge, 'run_lpac', side_effect=run), patch.object(bridge, 'sim_refresh', return_value=True) as refresh, patch.object(job.time, 'sleep') as sleep, patch.object(job, 'state', {}):
@@ -428,7 +428,7 @@ class BridgeFlows(unittest.TestCase):
         before = [{'seqNumber': 10}]
         after = before + [{'seqNumber': 12}, {'seqNumber': 11}]
         replies = iter([{'ok': True, 'data': before}, {'ok': True}, {'ok': True, 'data': after}, bridge.failed(), {'ok': True}])
-        def run(slot, argv, aid=''):
+        def run(slot, argv, aid='', **kwargs):
             requests.append(argv)
             return next(replies)
         with patch.object(bridge, 'run_lpac', side_effect=run), patch.object(job, 'publish'), patch.object(job, 'state', {}):

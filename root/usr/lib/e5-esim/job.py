@@ -115,8 +115,6 @@ def progress(message, data):
 
 def notify(slot, seq, remove, aid, cancel=None):
     argv = ['notification', 'remove', str(seq)] if remove else ['notification', 'process', '-r', str(seq)]
-    if cancel is None:
-        return bridge.run_lpac(slot, argv, aid=aid)
     return bridge.run_lpac(slot, argv, aid=aid, cancel=cancel)
 
 
@@ -139,10 +137,7 @@ def handle_notifications(slot, notifications, remove=False, aid='', cancel=None)
 
 
 def report_new(slot, before, aid='', cancel=None):
-    if cancel is None:
-        result = bridge.run_lpac(slot, ['notification', 'list'], aid=aid)
-    else:
-        result = bridge.run_lpac(slot, ['notification', 'list'], aid=aid, cancel=cancel)
+    result = bridge.run_lpac(slot, ['notification', 'list'], aid=aid, cancel=cancel)
     if not result['ok']:
         state['warning'] = 'notification_list'
         return
