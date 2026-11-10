@@ -2,7 +2,6 @@
 import fcntl
 import json
 import os
-import signal
 import subprocess
 import sys
 
@@ -14,6 +13,8 @@ STATUS = os.path.join(STATE_DIR, 'job.json')
 PIDFILE = os.path.join(STATE_DIR, 'job.pid')
 FIFO = os.path.join(STATE_DIR, 'job.in')
 LOCK = os.path.join(STATE_DIR, 'lock')
+CANCEL = os.path.join(STATE_DIR, 'cancel')
+LOCK_FD_ENV = 'E5_ESIM_LOCK_FD'
 JOB = '/usr/lib/e5-esim/job.py'
 SE_AIDS = ('A06573746B6D65FFFF4953442D522030', 'A06573746B6D65FFFF4953442D522031')
 
@@ -102,16 +103,33 @@ def acquire():
     return fd
 
 
+def clear_cancel():
+    try:
+        os.unlink(CANCEL)
+    except FileNotFoundError:
+        pass
+
+
+def write_cancel(pid):
+    path = '%s.tmp.%d' % (CANCEL, os.getpid())
+    with open(path, 'w') as file:
+        file.write(str(pid))
+    os.replace(path, CANCEL)
+
+
 def spawn(argv):
     fd = acquire()
     try:
+        clear_cancel()
         try:
             os.mkfifo(FIFO)
         except FileExistsError:
             pass
+        env = dict(os.environ)
+        env[LOCK_FD_ENV] = str(fd)
         proc = subprocess.Popen([sys.executable, JOB] + argv, pass_fds=(fd,), start_new_session=True,
                                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL)
+                               stderr=subprocess.DEVNULL, env=env)
         with open(PIDFILE, 'w') as file:
             file.write(str(proc.pid))
         status = dict(EMPTY, type=argv[0], state='running', slot=int(argv[1]), aid=argv[-1])
@@ -283,12 +301,18 @@ def job_confirm(params):
 
 
 def job_cancel(params):
+    status = job_status({})
+    if not status['running'] or status.get('type') != 'download' or status.get('state') != 'running':
+        return failure('cancel', 'no active download')
     try:
         with open(PIDFILE) as file:
             pid = int(file.read().strip())
-        os.kill(pid, signal.SIGINT)
     except (OSError, ValueError):
-        return failure(None, None)
+        return failure('cancel', 'no active download')
+    try:
+        write_cancel(pid)
+    except OSError:
+        return failure('cancel', '')
     return ok()
 
 

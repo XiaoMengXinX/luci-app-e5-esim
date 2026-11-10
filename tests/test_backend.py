@@ -4,8 +4,10 @@ import io
 import json
 import os
 from pathlib import Path
+import pty
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -59,6 +61,13 @@ class SnapshotRun:
 
 
 class BridgeFlows(unittest.TestCase):
+    def setUp(self):
+        self.state = tempfile.TemporaryDirectory()
+        self.addCleanup(self.state.cleanup)
+        patcher = patch.object(job, 'CANCEL', str(Path(self.state.name) / 'cancel'))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_write_progress_counts_accepted_bpp_bytes(self):
         events = []
         writer = bridge.WriteProgress(lambda message, data: events.append((message, data)))
@@ -130,6 +139,148 @@ class BridgeFlows(unittest.TestCase):
                 result = bridge.run_lpac(1, ['profile', 'download'], cancel=lambda: time.monotonic() - started > .2)
             self.assertFalse(result['ok'])
             self.assertLess(time.monotonic() - started, 2)
+
+    def test_ignored_sigint_returns_cancelled_after_short_grace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / 'ready'
+            executable = Path(directory) / 'lpac'
+            executable.write_text('#!/usr/bin/env python3\nimport os,signal,time\n'
+                                  'signal.signal(signal.SIGINT, signal.SIG_IGN)\n'
+                                  "open(os.environ['E5_READY'], 'w').close()\n"
+                                  'while True: time.sleep(.01)\n')
+            executable.chmod(0o755)
+            started = time.monotonic()
+            with patch.object(bridge, 'LPAC', str(executable)), \
+                    patch.object(bridge, 'open_device', return_value=None), \
+                    patch.dict(os.environ, {'E5_READY': str(marker)}):
+                result = bridge.run_lpac(1, ['profile', 'download'], cancel=marker.exists)
+            elapsed = time.monotonic() - started
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['error'], 'cancelled')
+        self.assertLessEqual(bridge.CANCEL_GRACE, 5)
+        self.assertGreaterEqual(elapsed, bridge.CANCEL_GRACE - .5)
+        self.assertLess(elapsed, bridge.CANCEL_GRACE + 2)
+
+    def test_cancel_waits_for_active_at_exchange(self):
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / 'lpac'
+            marker = Path(directory) / 'ready'
+            executable.write_text(
+                '#!/usr/bin/env python3\n'
+                'import os,signal,time\n'
+                'signal.signal(signal.SIGINT, signal.SIG_IGN)\n'
+                "with open(os.environ['LPAC_APDU_AT_DEVICE'], 'w', buffering=1) as device:\n"
+                "    device.write('AT+CCID\\r\\n')\n"
+                "open(os.environ['E5_READY'], 'w').close()\n"
+                'while True: time.sleep(.01)\n')
+            executable.chmod(0o755)
+            master, slave = pty.openpty()
+            try:
+                started = time.monotonic()
+                with patch.object(bridge, 'LPAC', str(executable)), \
+                        patch.object(bridge, 'open_device', return_value=slave), \
+                        patch.object(bridge, 'CHANNEL_TIMEOUT', .6), \
+                        patch.object(bridge, 'CANCEL_GRACE', .2), \
+                        patch.dict(os.environ, {'E5_READY': str(marker)}):
+                    result = bridge.run_lpac(1, ['chip', 'info'], cancel=marker.exists)
+                elapsed = time.monotonic() - started
+            finally:
+                os.close(master)
+        self.assertEqual(result['error'], 'cancelled')
+        self.assertGreaterEqual(elapsed, .55)
+        self.assertLess(elapsed, 2)
+
+    def test_cancel_covers_initial_notification_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            log = work / 'calls'
+            executable = work / 'lpac'
+            executable.write_text(
+                '#!/usr/bin/env python3\n'
+                'import os,signal,sys,time\n'
+                'signal.signal(signal.SIGINT, signal.SIG_IGN)\n'
+                "with open(os.environ['E5_TEST_LOG'], 'a') as output:\n"
+                "    output.write(' '.join(sys.argv[1:]) + '\\n')\n"
+                "with open(os.environ['E5_CANCEL'], 'w') as output:\n"
+                "    output.write(os.environ['E5_CANCEL_PID'])\n"
+                'while True: time.sleep(.01)\n')
+            executable.chmod(0o755)
+            with patch.object(bridge, 'LPAC', str(executable)), \
+                    patch.object(bridge, 'open_device', return_value=None), \
+                    patch.object(bridge, 'CANCEL_GRACE', .2), \
+                    patch.dict(os.environ, {'E5_TEST_LOG': str(log), 'E5_CANCEL': job.CANCEL,
+                                            'E5_CANCEL_PID': str(os.getpid())}):
+                result = job.download(1, 'LPA:1$x', '')
+            calls = log.read_text().splitlines()
+        self.assertEqual(result['error'], 'cancelled')
+        self.assertEqual(calls, ['notification list'])
+
+    def test_preview_stops_on_cancel_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            fifo = work / 'job.in'
+            os.mkfifo(fifo)
+            Path(job.CANCEL).write_text(str(os.getpid()))
+            started = time.monotonic()
+            with patch.object(job, 'FIFO', str(fifo)), \
+                    patch.object(job, 'STATUS', str(work / 'job.json')), \
+                    patch.object(job, 'publish'):
+                answer = job.preview()
+            elapsed = time.monotonic() - started
+        self.assertFalse(answer)
+        self.assertLess(elapsed, 1)
+
+    def test_job_cancel_writes_pid_request_without_signals_and_refuses_operations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            pidfile, status, cancel = work / 'job.pid', work / 'job.json', work / 'cancel'
+            pidfile.write_text(str(os.getpid()))
+            status.write_text(json.dumps({'type': 'download', 'state': 'running'}))
+            with patch.multiple(rpc, PIDFILE=str(pidfile), STATUS=str(status), CANCEL=str(cancel)), \
+                    patch.object(rpc, 'job_status', return_value={'running': True, 'type': 'download', 'state': 'running'}), \
+                    patch.object(rpc.os, 'kill', side_effect=AssertionError('must not signal')):
+                result = rpc.job_cancel({})
+            self.assertTrue(result['ok'])
+            self.assertEqual(cancel.read_text(), str(os.getpid()))
+
+            cancel.unlink()
+            with patch.multiple(rpc, PIDFILE=str(pidfile), STATUS=str(status), CANCEL=str(cancel)), \
+                    patch.object(rpc, 'job_status', return_value={'running': True, 'type': 'operation', 'state': 'running'}):
+                result = rpc.job_cancel({})
+            self.assertFalse(result['ok'])
+            self.assertEqual(result['error'], 'cancel')
+            self.assertEqual(result['detail'], 'no active download')
+            self.assertFalse(cancel.exists())
+
+    def test_cancel_request_before_signal_handler_is_pid_scoped(self):
+        Path(job.CANCEL).write_text(str(os.getpid()))
+        self.assertTrue(job.cancel_requested())
+        Path(job.CANCEL).write_text(str(os.getpid() + 1))
+        self.assertFalse(job.cancel_requested())
+
+    def test_cancel_preserves_already_committed_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / 'lpac'
+            marker = Path(directory) / 'ready'
+            executable.write_text(
+                '#!/usr/bin/env python3\n'
+                'import json,os,signal,time\n'
+                'signal.signal(signal.SIGINT, signal.SIG_IGN)\n'
+                "print(json.dumps({'type': 'lpa', 'payload': {'code': 0, 'data': {'ok': True}, 'message': ''}}), flush=True)\n"
+                "open(os.environ['E5_READY'], 'w').close()\n"
+                'while True: time.sleep(.01)\n')
+            executable.chmod(0o755)
+            started = time.monotonic()
+            with patch.object(bridge, 'LPAC', str(executable)), \
+                    patch.object(bridge, 'open_device', return_value=None), \
+                    patch.object(bridge, 'CANCEL_GRACE', .2), \
+                    patch.dict(os.environ, {'E5_READY': str(marker)}):
+                result = bridge.run_lpac(1, ['profile', 'download'], cancel=marker.exists)
+            elapsed = time.monotonic() - started
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['data'], {'ok': True})
+        self.assertGreaterEqual(elapsed, .1)
+        self.assertLess(elapsed, 2)
 
     def test_profiles_obeys_job_lock(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -255,6 +406,23 @@ class BridgeFlows(unittest.TestCase):
         self.assertEqual([call.args[1] for call in run.call_args_list].count(['profile', 'list']), 6)
         self.assertNotIn('profile_state_pending', state)
 
+    def test_auto_report_stops_after_cancel_and_marks_pending(self):
+        state = {}
+        cancelled = [False]
+        commands = []
+        def notify(slot, seq, remove, aid, cancel=None):
+            commands.append(['notification', 'process', '-r', str(seq)])
+            cancelled[0] = True
+            return {'ok': True, 'data': None, 'error': None, 'detail': None}
+        pending = [{'seqNumber': 1}, {'seqNumber': 2}, {'seqNumber': 3}]
+        with patch.object(job, 'state', state), patch.object(job, 'publish'), \
+                patch.object(bridge, 'run_lpac', return_value={'ok': True, 'data': pending}), \
+                patch.object(job, 'notify', side_effect=notify):
+            job.report_new(1, [], cancel=lambda: cancelled[0])
+        self.assertEqual(commands, [['notification', 'process', '-r', '1']])
+        self.assertEqual(state['pending'], 2)
+        self.assertEqual(state['warning'], 'notification_report')
+
     def test_delete_reports_only_new_notifications_in_order(self):
         requests = []
         before = [{'seqNumber': 10}]
@@ -302,6 +470,45 @@ class BridgeFlows(unittest.TestCase):
             self.assertEqual(job.operation(1, {'action': 'delete', 'iccid': '123'}), error)
             self.assertEqual(run.call_count, 2)
 
+    def test_background_cancellation_publishes_terminal_state_before_lock_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            worker = work / 'worker.py'
+            worker.write_text(
+                "import importlib.util,sys,types\n"
+                "bridge=types.ModuleType('bridge')\n"
+                "bridge.run_lpac=lambda *args, **kwargs: {'ok': False, 'data': None, 'error': 'cancelled', 'detail': ''}\n"
+                "bridge.cancelled_result=lambda: {'ok': False, 'data': None, 'error': 'cancelled', 'detail': ''}\n"
+                "sys.modules['bridge']=bridge\n"
+                "spec=importlib.util.spec_from_file_location('job', %r)\n" % str(BASE / 'root/usr/lib/e5-esim/job.py') +
+                "job=importlib.util.module_from_spec(spec); spec.loader.exec_module(job)\n"
+                "job.STATE_DIR=%r\n" % directory +
+                "job.STATUS=%r; job.PIDFILE=%r; job.FIFO=%r; job.CANCEL=%r\n" % tuple(str(work / name) for name in ('job.json', 'job.pid', 'job.in', 'cancel')) +
+                "job.main(sys.argv[1:])\n")
+            processes = []
+            popen = rpc.subprocess.Popen
+            def launch(*args, **kwargs):
+                process = popen(*args, **kwargs)
+                processes.append(process)
+                return process
+            with patch.multiple(rpc, STATE_DIR=directory, STATUS=str(work / 'job.json'),
+                                PIDFILE=str(work / 'job.pid'), FIFO=str(work / 'job.in'),
+                                LOCK=str(work / 'lock'), CANCEL=str(work / 'cancel'),
+                                JOB=str(worker)), patch.object(rpc.subprocess, 'Popen', side_effect=launch):
+                self.assertTrue(rpc.download_start({'slot': 1, 'activation': 'LPA:1$x',
+                                                    'confirmation': '', 'aid': ''})['ok'])
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    status = rpc.job_status({})
+                    if not status['running']:
+                        break
+                    time.sleep(.02)
+            self.assertEqual(status['state'], 'cancelled')
+            self.assertEqual(status['error'], 'cancelled')
+            fd = rpc.acquire()
+            os.close(fd)
+            processes[0].wait(timeout=2)
+
     def test_background_operation_publishes_completion_and_releases_lock(self):
         import time
         with tempfile.TemporaryDirectory() as directory:
@@ -313,7 +520,7 @@ class BridgeFlows(unittest.TestCase):
                 "spec=importlib.util.spec_from_file_location('job', %r)\n" % str(BASE / 'root/usr/lib/e5-esim/job.py') +
                 "job=importlib.util.module_from_spec(spec); spec.loader.exec_module(job)\n"
                 "job.STATE_DIR=%r\n" % directory +
-                "job.STATUS=%r; job.PIDFILE=%r; job.FIFO=%r\n" % tuple(str(work / name) for name in ('job.json', 'job.pid', 'job.in')) +
+                "job.STATUS=%r; job.PIDFILE=%r; job.FIFO=%r; job.CANCEL=%r\n" % tuple(str(work / name) for name in ('job.json', 'job.pid', 'job.in', 'cancel')) +
                 "job.main(sys.argv[1:])\n")
             processes = []
             popen = rpc.subprocess.Popen
@@ -323,7 +530,8 @@ class BridgeFlows(unittest.TestCase):
                 return process
             with patch.multiple(rpc, STATE_DIR=directory, STATUS=str(work / 'job.json'),
                                 PIDFILE=str(work / 'job.pid'), FIFO=str(work / 'job.in'),
-                                LOCK=str(work / 'lock'), JOB=str(worker)), patch.object(rpc.subprocess, 'Popen', side_effect=launch):
+                                LOCK=str(work / 'lock'), CANCEL=str(work / 'cancel'),
+                                JOB=str(worker)), patch.object(rpc.subprocess, 'Popen', side_effect=launch):
                 result = rpc.operation_start({'slot': 1, 'aid': rpc.SE_AIDS[1], 'request': json.dumps({'action': 'rename', 'iccid': '123', 'name': 'test'})})
                 self.assertTrue(result['ok'])
                 deadline = time.monotonic() + 3
@@ -386,7 +594,8 @@ class BridgeFlows(unittest.TestCase):
             work = Path(directory)
             with patch.multiple(rpc, STATE_DIR=directory, STATUS=str(work / 'job.json'),
                                 PIDFILE=str(work / 'job.pid'), FIFO=str(work / 'job.in'),
-                                LOCK=str(work / 'lock'), write_status=recorded.append), \
+                                LOCK=str(work / 'lock'), CANCEL=str(work / 'cancel'),
+                                write_status=recorded.append), \
                     patch.object(rpc.subprocess, 'Popen', side_effect=Proc) as popen:
                 self.assertTrue(rpc.download_start({'slot': 1, 'activation': 'LPA:1$x',
                                                     'confirmation': 'code', 'aid': SE0})['ok'])

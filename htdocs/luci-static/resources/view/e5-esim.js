@@ -133,12 +133,13 @@ function createPage(loaded) {
 		view: 'loading', action: null, current: 0, pick: true,
 		iccid: '', name: '', enabled: false,
 		activation: '', confirmation: '',
-		downloading: false, cancelling: false,
+		downloading: false, cancelling: false, launching: false, downloadStarted: false,
+		cancelPending: false, needsStatus: false, downloadError: '',
 		metadata: null, seq: 0, disposed: false, resuming: false, deps: deps || null
 	};
 	var slots = [ newSlot(), newSlot() ];
 	var bulk = { total: 0, next: 0, remove: false, running: false };
-	var pollTimer = null, openModal = false, previewShown = false;
+	var pollTimer = null, pollGeneration = 0, openModal = false, previewShown = false;
 	var restoreSEFocus = false, selectedSEControl = null;
 	var stepNode = null;
 	var downloadMeter = null, downloadFill = null, writeValue = null, writeBytes = null;
@@ -326,6 +327,16 @@ function createPage(loaded) {
 			return [ dependencyCard() ];
 		case 'download':
 			return downloadNodes();
+		case 'download_status':
+			return [ card([
+				heading(tr('下载任务状态', 'Download task status')),
+				message(state.downloadError),
+				note(tr('确认任务状态后可继续操作。', 'Check the task status before continuing.')),
+				E('div', { class: 'e5-actions' }, [
+					button(tr('重新查询状态', 'Check status'), 'apply', checkDownloadStatus),
+					cancelButton(cancelDownload)
+				])
+			]) ];
 		case 'rename':
 			return renameNodes();
 		case 'notifs':
@@ -492,22 +503,28 @@ function createPage(loaded) {
 		];
 	}
 
-	function poll(fn) {
+	function poll(fn, onError, generation) {
+		if (generation == null) generation = pollGeneration;
 		pollTimer = window.setTimeout(function() {
+			if (state.disposed || generation !== pollGeneration) return;
 			pollTimer = null;
 			callJobStatus().then(function(job) {
-				if (state.disposed)
+				if (state.disposed || generation !== pollGeneration)
 					return;
-				if (fn(job) !== false)
-					poll(fn);
-			}).catch(function() {
-				if (!state.disposed)
-					poll(fn);
+				var again = fn(job);
+				if (again !== false && generation === pollGeneration)
+					poll(fn, onError, generation);
+			}, function(error) {
+				if (state.disposed || generation !== pollGeneration)
+					return;
+				if (!onError || onError(error) !== false)
+					poll(fn, onError, generation);
 			});
 		}, 1000);
 	}
 
 	function stopPoll() {
+		pollGeneration++;
 		if (pollTimer) {
 			window.clearTimeout(pollTimer);
 			pollTimer = null;
@@ -774,24 +791,95 @@ function createPage(loaded) {
 			toast(tr('请输入激活码', 'Enter the activation code'));
 			return;
 		}
+		if (state.downloading) return;
 		state.action = 'download';
 		state.downloading = true;
+		state.launching = true;
+		state.downloadStarted = false;
 		state.cancelling = false;
+		state.cancelPending = false;
+		state.needsStatus = false;
 		previewShown = false;
 		openProgress(null);
 		callDownloadStart(state.current, state.activation, state.confirmation, slots[state.current].aid).then(function(result) {
 			if (state.disposed) return;
+			state.launching = false;
+			if (!result || typeof result.ok !== 'boolean') {
+				showDownloadRecovery();
+				checkDownloadStatus();
+				return;
+			}
 			if (!result.ok) {
 				finishDownload(false, result.error, result.detail);
 				return;
 			}
-			if (state.cancelling) callJobCancel();
-			watchDownload();
+			state.downloadStarted = true;
+			if (state.cancelling) sendDownloadCancel();
+			else watchDownload();
+		}, function(error) {
+			if (state.disposed) return;
+			state.launching = false;
+			showDownloadRecovery(error);
+			checkDownloadStatus();
 		});
 	}
 
+	function showDownloadRecovery(error) {
+		if (state.disposed || !state.downloading) return;
+		stopPoll();
+		closeDialog();
+		state.needsStatus = true;
+		state.downloadError = error && error.message ||
+			tr('暂时无法确认下载任务状态，请重新查询。', 'Cannot determine the download task status. Check again.');
+		state.view = 'download_status';
+		render();
+	}
+
+	function matchingDownload(job) {
+		return job && job.type === 'download' && job.slot === state.current &&
+			(job.aid || '') === slots[state.current].aid;
+	}
+
+	function checkDownloadStatus() {
+		stopPoll();
+		callJobStatus().then(function(job) {
+			if (state.disposed || !state.downloading) return;
+			if (!job || typeof job.running !== 'boolean') {
+				showDownloadRecovery();
+				return;
+			}
+			if (job.running) {
+				if (!matchingDownload(job)) {
+					showDownloadRecovery(new Error(tr('另一个任务正在运行，请稍后重新查询。', 'Another task is running. Check again later.')));
+					return;
+				}
+				state.downloadStarted = true;
+				state.needsStatus = false;
+				if (state.cancelling) sendDownloadCancel();
+				else {
+					openProgress(null);
+					previewShown = false;
+					watchDownload();
+				}
+				return;
+			}
+			if (state.downloadStarted && matchingDownload(job)) {
+				warnJob(job);
+				finishDownload(job.state === 'done', job.error || 'lpac', job.detail);
+			}
+			else finishDownload(false, 'rpc', state.downloadError);
+		}, showDownloadRecovery);
+	}
+
 	function watchDownload() {
+		stopPoll();
+		var failures = 0;
 		poll(function(job) {
+			if (!job || typeof job.running !== 'boolean' || !matchingDownload(job)) {
+				showDownloadRecovery();
+				return false;
+			}
+			failures = 0;
 			if (!job.running) {
 				warnJob(job);
 				finishDownload(job.state === 'done', job.error || 'lpac', job.detail);
@@ -817,6 +905,10 @@ function createPage(loaded) {
 				previewShown = false;
 				updateDownloadProgress(job);
 			}
+		}, function(error) {
+			if (++failures < 3) return;
+			showDownloadRecovery(error);
+			return false;
 		});
 	}
 
@@ -841,23 +933,49 @@ function createPage(loaded) {
 				return;
 			}
 			openProgress(null);
+		}, showDownloadRecovery);
+	}
+
+	function sendDownloadCancel() {
+		if (state.cancelPending) return;
+		state.cancelPending = true;
+		watchDownload();
+		callJobCancel().then(function(result) {
+			if (state.disposed || !state.downloading) return;
+			state.cancelPending = false;
+			if (!result || !result.ok) {
+				showDownloadRecovery(new Error(tr('取消请求失败，请重新查询状态或重试。', 'Cancellation failed. Check the status or retry.')));
+				watchDownload();
+			}
+		}, function(error) {
+			if (state.disposed || !state.downloading) return;
+			state.cancelPending = false;
+			showDownloadRecovery(error);
+			watchDownload();
 		});
 	}
 
 	function cancelDownload() {
+		if (!state.downloading || state.cancelPending) return;
 		closeDialog();
 		state.cancelling = true;
 		state.view = 'wait';
 		render();
-		callJobCancel();
+		if (state.launching) return;
+		if (state.needsStatus) checkDownloadStatus();
+		else sendDownloadCancel();
 	}
 
 	function finishDownload(ok, error, detail) {
 		if (state.disposed)
 			return;
+		stopPoll();
 		state.downloading = false;
-		if (!state.cancelling)
-			closeDialog();
+		state.launching = false;
+		state.cancelPending = false;
+		state.needsStatus = false;
+		state.action = null;
+		closeDialog();
 		stepNode = null;
 		state.metadata = null;
 		if (!ok) {
@@ -929,6 +1047,7 @@ function createPage(loaded) {
 		slots[state.current].aid = job.aid || '';
 		state.action = 'download';
 		state.downloading = true;
+		state.downloadStarted = true;
 		state.view = 'wait';
 		render();
 		openProgress(null);

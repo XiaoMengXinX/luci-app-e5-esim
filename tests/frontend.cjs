@@ -32,7 +32,7 @@ function matching(node, predicate) {
     return (predicate(node) ? [node] : []).concat(node.children.flatMap(child => matching(child, predicate)));
 }
 function harness(respond) {
-    const calls = [], timers = new Map();
+    const calls = [], timers = new Map(), notices = [];
     let timer = 0, modal = null;
     const api = vm.runInNewContext('(function(){' + source + '\n})()', {
         E: (tag, attrs, children) => new Node(tag, attrs, children),
@@ -43,12 +43,13 @@ function harness(respond) {
             calls.push([spec.method, ...args]);
             return Promise.resolve(respond(spec.method, args));
         } },
-        ui: { showModal(title, children, ...classes) { modal = new Node('dialog', { class: classes.join(' ') }, children); }, hideModal() { modal = null; }, addNotification() {} },
+        ui: { showModal(title, children, ...classes) { modal = new Node('dialog', { class: classes.join(' ') }, children); }, hideModal() { modal = null; }, addNotification(title, content) { notices.push(content.textContent); } },
         window: { setTimeout(fn) { timers.set(++timer, fn); return timer; }, clearTimeout(id) { timers.delete(id); } }
     });
     let root;
     return {
-        calls, api, get root() { return root; }, get modal() { return modal; },
+        calls, notices, api, get root() { return root; }, get modal() { return modal; },
+        get pendingTimers() { return timers.size; },
         async open(job = null, deps = null) { root = api.render({ job, deps }); await flush(); },
         async openViaLoad() { const loaded = await api.load(); root = api.render(loaded); await flush(); return loaded; },
         async click(text) {
@@ -154,12 +155,12 @@ const snapshot = { ok: true, chip: good({ eidValue: 'EID' }), profiles: good(pro
     assert.deepEqual(seSnapshots, [[0, se1, false]]);
     multi.api.unload();
 
-    let progressJob = { running: true, step: 'es9p_authenticate_client' };
+    let progressJob = { type: 'download', slot: 1, aid: '', running: true, step: 'es9p_authenticate_client' };
     const progress = harness(() => progressJob);
     await progress.open({ type: 'download', running: true, slot: 1 });
     await progress.tick();
     assert.equal(progress.modal.textContent.includes('%'), false);
-    progressJob = { running: true, step: 'es10b_load_bound_profile_package', write: { written: 6300, total: 10000, percent: 63 } };
+    progressJob = { type: 'download', slot: 1, aid: '', running: true, step: 'es10b_load_bound_profile_package', write: { written: 6300, total: 10000, percent: 63 } };
     await progress.tick();
     assert.ok(progress.modal.textContent.includes('63%'));
     progressJob.write = { written: 10000, total: 10000, percent: 100 };
@@ -172,7 +173,7 @@ const snapshot = { ok: true, chip: good({ eidValue: 'EID' }), profiles: good(pro
         if (method === 'snapshot') return snapshot;
         if (method === 'notifications') return good([]);
         if (method === 'download_start') return new Promise(resolve => { launch = resolve; });
-        if (method === 'job_status') return { running: true, preview: true, metadata: { profileName: 'Preview' } };
+        if (method === 'job_status') return { type: 'download', slot: 0, aid: '', running: true, preview: true, metadata: { profileName: 'Preview' } };
         return good(null);
     });
     await c.open();
@@ -187,11 +188,152 @@ const snapshot = { ok: true, chip: good({ eidValue: 'EID' }), profiles: good(pro
     await c.click('Download');
     await c.click('Cancel');
     launch(good(null)); await flush();
-    assert.equal(c.calls.filter(call => call[0] === 'job_cancel').length, 2);
+    assert.equal(c.calls.filter(call => call[0] === 'job_cancel').length, 1);
     await c.tick();
     assert.equal(c.calls.filter(call => call[0] === 'job_confirm').length, 0);
     assert.ok(c.root.textContent.includes('Cancelling download'));
     c.api.unload();
+
+    const downloadJob = extra => ({ type: 'download', slot: 0, aid: '', running: true, ...extra });
+    async function beginDownload(page) {
+        await page.open();
+        await page.click('Add profile');
+        matching(page.root, node => node.tag === 'input')[0].attrs.input({ target: { value: 'LPA:1$example.invalid$unused' } });
+        await page.click('Download');
+    }
+    let activeJob = downloadJob({ step: 'es9p_initiate_authentication' });
+    const lostReply = harness(method => {
+        if (method === 'snapshot') return snapshot;
+        if (method === 'download_start') return Promise.reject(new Error('start reply lost'));
+        if (method === 'job_status') return activeJob;
+        return good(null);
+    });
+    await beginDownload(lostReply);
+    assert.ok(lostReply.modal, 'lost start reply must reconnect to the running task');
+    assert.equal(lostReply.calls.filter(call => call[0] === 'download_start').length, 1);
+    await lostReply.click('Cancel');
+    activeJob = downloadJob({ running: false, state: 'cancelled', error: 'cancelled' });
+    await lostReply.tick();
+    assert.ok(lostReply.root.textContent.includes('Activation code'));
+    assert.ok(lostReply.notices.includes('Download cancelled'));
+    assert.equal(lostReply.pendingTimers, 0);
+    lostReply.api.unload();
+
+    const noTask = harness(method => {
+        if (method === 'snapshot') return snapshot;
+        if (method === 'download_start') return Promise.reject(new Error('request did not arrive'));
+        if (method === 'job_status') return downloadJob({ running: false, state: 'done' });
+        return good(null);
+    });
+    await beginDownload(noTask);
+    assert.ok(noTask.root.textContent.includes('Activation code'));
+    assert.equal(noTask.pendingTimers, 0);
+    assert.ok(noTask.notices.includes('request did not arrive'));
+    assert.equal(noTask.notices.includes('Profile downloaded'), false, 'stale successful task must not acknowledge a failed start');
+    noTask.api.unload();
+
+    let offline = true;
+    activeJob = downloadJob({ step: 'es9p_initiate_authentication' });
+    const uncertain = harness(method => {
+        if (method === 'snapshot') return snapshot;
+        if (method === 'download_start') return Promise.reject(new Error('start reply lost'));
+        if (method === 'job_status') return offline ? Promise.reject(new Error('offline')) : activeJob;
+        return good(null);
+    });
+    await beginDownload(uncertain);
+    assert.ok(uncertain.root.textContent.includes('Check status'));
+    assert.equal(uncertain.pendingTimers, 0);
+    await uncertain.click('Cancel');
+    assert.ok(uncertain.root.textContent.includes('Check status'));
+    offline = false;
+    await uncertain.click('Check status');
+    assert.equal(uncertain.calls.filter(call => call[0] === 'job_cancel').length, 1);
+    activeJob = downloadJob({ running: false, state: 'cancelled', error: 'cancelled' });
+    await uncertain.tick();
+    assert.ok(uncertain.root.textContent.includes('Activation code'));
+    assert.equal(uncertain.calls.filter(call => call[0] === 'download_start').length, 1);
+    uncertain.api.unload();
+
+    let cancellationFails = true;
+    activeJob = downloadJob({ preview: true, metadata: { profileName: 'Preview' } });
+    const retryCancel = harness(method => {
+        if (method === 'snapshot') return snapshot;
+        if (method === 'job_status') return activeJob;
+        if (method === 'job_cancel' && cancellationFails) return { ok: false, error: 'busy' };
+        return good(null);
+    });
+    await beginDownload(retryCancel);
+    await retryCancel.tick();
+    await retryCancel.click('Cancel');
+    assert.ok(retryCancel.root.textContent.includes('Cancellation failed'));
+    assert.ok(retryCancel.root.textContent.includes('Check status'));
+    cancellationFails = false;
+    await retryCancel.click('Cancel');
+    assert.equal(retryCancel.calls.filter(call => call[0] === 'job_cancel').length, 2);
+    activeJob = downloadJob({ running: false, state: 'cancelled', error: 'cancelled' });
+    await retryCancel.tick();
+    assert.equal(retryCancel.pendingTimers, 0);
+    retryCancel.api.unload();
+
+    let cancelReply;
+    activeJob = downloadJob({ step: 'es9p_initiate_authentication' });
+    const lateCancel = harness(method => {
+        if (method === 'snapshot') return snapshot;
+        if (method === 'job_status') return activeJob;
+        if (method === 'job_cancel') return new Promise(resolve => { cancelReply = resolve; });
+        return good(null);
+    });
+    await beginDownload(lateCancel);
+    await lateCancel.click('Cancel');
+    activeJob = downloadJob({ running: false, state: 'cancelled', error: 'cancelled' });
+    await lateCancel.tick();
+    cancelReply({ ok: false, error: 'cancel' });
+    await flush();
+    assert.ok(lateCancel.root.textContent.includes('Activation code'));
+    assert.equal(lateCancel.root.textContent.includes('Check status'), false);
+    assert.equal(lateCancel.pendingTimers, 0);
+    lateCancel.api.unload();
+
+    let cancelOffline = true;
+    activeJob = downloadJob({ step: 'es9p_initiate_authentication' });
+    const cancelOutage = harness(method => {
+        if (method === 'snapshot') return snapshot;
+        if (method === 'job_status') return activeJob;
+        if (method === 'job_cancel' && cancelOffline) return Promise.reject(new Error('cancel transport offline'));
+        return good(null);
+    });
+    await beginDownload(cancelOutage);
+    await cancelOutage.click('Cancel');
+    assert.ok(cancelOutage.root.textContent.includes('cancel transport offline'));
+    cancelOffline = false;
+    await cancelOutage.click('Cancel');
+    activeJob = downloadJob({ running: false, state: 'cancelled', error: 'cancelled' });
+    await cancelOutage.tick();
+    assert.ok(cancelOutage.root.textContent.includes('Activation code'));
+    assert.equal(cancelOutage.calls.filter(call => call[0] === 'download_start').length, 1);
+    cancelOutage.api.unload();
+
+    offline = true;
+    activeJob = downloadJob({ step: 'es9p_initiate_authentication' });
+    const outage = harness(method => {
+        if (method === 'snapshot') return snapshot;
+        if (method === 'job_status') return offline ? Promise.reject(new Error('status offline')) : activeJob;
+        return good(null);
+    });
+    await beginDownload(outage);
+    await outage.tick(); await outage.tick(); await outage.tick();
+    assert.equal(outage.pendingTimers, 0);
+    assert.ok(outage.root.textContent.includes('Check status'));
+    offline = false;
+    await outage.click('Check status');
+    assert.ok(outage.modal);
+    await outage.click('Cancel');
+    activeJob = downloadJob({ running: false, state: 'done' });
+    await outage.tick();
+    assert.ok(outage.notices.includes('Profile downloaded'), 'completed installation must remain successful after a late cancel');
+    assert.equal(outage.notices.includes('Download cancelled'), false);
+    outage.api.unload();
+
     const depItems = [
         { package: 'lpac', path: '/usr/lib/lpac', present: false },
         { package: 'libcurl-gnutls4', path: '/usr/lib/libcurl-gnutls.so.4', present: true }
@@ -232,6 +374,6 @@ const snapshot = { ok: true, chip: good({ eidValue: 'EID' }), profiles: good(pro
     assert.ok(partial.root.textContent.includes('apk update && apk add libcurl-gnutls4'));
     partial.api.unload();
 
-    console.log('Frontend flows passed: slot fallback/selection, multi-SE routing, switch sequence, cancel during launch, dependency guidance.');
+    console.log('Frontend flows passed: slot fallback/selection, multi-SE routing, switch sequence, download cancellation/recovery, dependency guidance.');
 
 })().catch(error => { console.error(error); process.exitCode = 1; });

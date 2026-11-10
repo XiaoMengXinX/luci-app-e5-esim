@@ -22,12 +22,16 @@ TRANSMIT_TIMEOUT = 25
 SIM_TIMEOUT = 10
 PROBES = 5
 PERIOD = 0.04
-CANCEL_GRACE = 60
+CANCEL_GRACE = 3
 HEX = '0123456789abcdefABCDEF'
 
 
 def failed():
     return {'ok': False, 'data': None, 'error': 'lpac', 'detail': ''}
+
+
+def cancelled_result():
+    return {'ok': False, 'data': None, 'error': 'cancelled', 'detail': ''}
 
 
 def tls_shim(env):
@@ -121,6 +125,7 @@ class At:
         self.device = device
         self.card = card
         self.poll = poll
+        self.active = False
 
     def drain(self):
         while select.select([self.device], [], [], 0)[0]:
@@ -133,25 +138,30 @@ class At:
     def command(self, body, timeout):
         if self.device is None:
             return ''
-        self.drain()
-        os.write(self.device, ('AT+SPACTCARD=%d;%s\r\n' % (self.card, body)).encode())
-        reply = ''
-        end = time.monotonic() + timeout
-        while not complete(reply):
-            remaining = end - time.monotonic()
-            if remaining <= 0:
-                break
-            self.poll()
-            if not select.select([self.device], [], [], min(remaining, PERIOD))[0]:
-                continue
-            try:
-                chunk = os.read(self.device, 4096)
-            except OSError:
-                break
-            if not chunk:
-                break
-            reply += chunk.decode('utf-8', 'replace')
-        return reply
+        self.poll()
+        self.active = True
+        try:
+            self.drain()
+            os.write(self.device, ('AT+SPACTCARD=%d;%s\r\n' % (self.card, body)).encode())
+            reply = ''
+            end = time.monotonic() + timeout
+            while not complete(reply):
+                remaining = end - time.monotonic()
+                if remaining <= 0:
+                    break
+                self.poll()
+                if not select.select([self.device], [], [], min(remaining, PERIOD))[0]:
+                    continue
+                try:
+                    chunk = os.read(self.device, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                reply += chunk.decode('utf-8', 'replace')
+            return reply
+        finally:
+            self.active = False
 
 
 class WriteProgress:
@@ -389,18 +399,30 @@ def run_lpac(card, argv, on_progress=None, on_preview=None, cancel=None, aid='')
                 os.close(fd)
         return failed()
     device = open_device()
-    outcome = {'result': None, 'started': time.monotonic(), 'cancel_at': None}
+    outcome = {'result': None, 'started': time.monotonic(), 'cancel_at': None,
+               'deadline_at': None, 'active': False, 'cleanup_used': False}
     writer = WriteProgress(on_progress) if on_progress and argv[:2] == ['profile', 'download'] else None
 
     def poll():
         now = time.monotonic()
+        was_active = outcome['active']
+        outcome['active'] = active = ring.active
         if outcome['cancel_at'] is None and cancel is not None and cancel():
             outcome['cancel_at'] = now
-            proc.send_signal(signal.SIGINT)
         if outcome['cancel_at'] is not None:
-            if now - outcome['cancel_at'] >= CANCEL_GRACE:
+            if active:
+                return
+            if outcome['deadline_at'] is None:
+                outcome['deadline_at'] = now + CANCEL_GRACE
+                if proc.poll() is None:
+                    proc.send_signal(signal.SIGINT)
+                return
+            if was_active and now >= outcome['deadline_at'] and not outcome['cleanup_used']:
+                outcome['cleanup_used'] = True
+                outcome['deadline_at'] = now + CANCEL_GRACE
+            if now >= outcome['deadline_at']:
                 raise Deadline()
-        elif now - outcome['started'] >= watchdog:
+        elif not active and now - outcome['started'] >= watchdog:
             raise Deadline()
 
     def send(text):
@@ -437,7 +459,8 @@ def run_lpac(card, argv, on_progress=None, on_preview=None, cancel=None, aid='')
                              'error': None if ok else (payload.get('message') or ''),
                              'detail': None if ok else (data if isinstance(data, str) else '')}
 
-    bridge = Bridge(master, At(device, card, poll), writer.accept if writer else None)
+    ring = At(device, card, poll)
+    bridge = Bridge(master, ring, writer.accept if writer else None)
     out = b''
     pending = b''
     out_fd = proc.stdout.fileno()
@@ -465,8 +488,11 @@ def run_lpac(card, argv, on_progress=None, on_preview=None, cancel=None, aid='')
         while proc.poll() is None:
             poll()
             time.sleep(PERIOD)
-    except (Deadline, OSError):
-        outcome['result'] = failed()
+    except Deadline:
+        pass
+    except OSError:
+        if outcome['cancel_at'] is None:
+            outcome['result'] = failed()
     finally:
         if proc.poll() is None:
             proc.kill()
@@ -476,4 +502,8 @@ def run_lpac(card, argv, on_progress=None, on_preview=None, cancel=None, aid='')
         for fd in (master, slave, device):
             if fd is not None:
                 os.close(fd)
+    if outcome['result'] is not None and outcome['result']['ok']:
+        return outcome['result']
+    if outcome['cancel_at'] is not None:
+        return cancelled_result()
     return outcome['result'] or failed()

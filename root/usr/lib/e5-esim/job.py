@@ -11,11 +11,13 @@ STATE_DIR = '/tmp/e5-esim'
 STATUS = os.path.join(STATE_DIR, 'job.json')
 PIDFILE = os.path.join(STATE_DIR, 'job.pid')
 FIFO = os.path.join(STATE_DIR, 'job.in')
+CANCEL = os.path.join(STATE_DIR, 'cancel')
+LOCK_FD = 'E5_ESIM_LOCK_FD'
 
 state = {'type': None, 'state': 'running', 'step': None, 'preview': False, 'metadata': None,
          'error': None, 'detail': None}
 
-cancelled = False
+signal_cancelled = False
 
 
 def publish():
@@ -26,8 +28,55 @@ def publish():
 
 
 def stop(number, frame):
-    global cancelled
-    cancelled = True
+    global signal_cancelled
+    signal_cancelled = True
+
+
+def cancel_requested():
+    if signal_cancelled:
+        return True
+    try:
+        with open(CANCEL) as file:
+            return int(file.read().strip()) == os.getpid()
+    except (OSError, ValueError):
+        return False
+
+
+def remove_cancel():
+    try:
+        with open(CANCEL) as file:
+            if int(file.read().strip()) != os.getpid():
+                return
+    except (OSError, ValueError):
+        return
+    try:
+        os.unlink(CANCEL)
+    except FileNotFoundError:
+        pass
+
+
+def release_lock():
+    try:
+        fd = int(os.environ.get(LOCK_FD, ''))
+    except (TypeError, ValueError):
+        return
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def remove_pidfile():
+    try:
+        with open(PIDFILE) as file:
+            if int(file.read().strip()) != os.getpid():
+                return
+    except (OSError, ValueError):
+        return
+    try:
+        os.unlink(PIDFILE)
+    except FileNotFoundError:
+        pass
 
 
 def preview():
@@ -37,7 +86,7 @@ def preview():
     try:
         state['preview'] = True
         publish()
-        while not cancelled:
+        while not cancel_requested():
             if not select.select([fd], [], [], 0.5)[0]:
                 continue
             data = os.read(fd, 16)
@@ -64,31 +113,43 @@ def progress(message, data):
     publish()
 
 
-def notify(slot, seq, remove, aid):
+def notify(slot, seq, remove, aid, cancel=None):
     argv = ['notification', 'remove', str(seq)] if remove else ['notification', 'process', '-r', str(seq)]
-    return bridge.run_lpac(slot, argv, aid=aid)
+    if cancel is None:
+        return bridge.run_lpac(slot, argv, aid=aid)
+    return bridge.run_lpac(slot, argv, aid=aid, cancel=cancel)
 
 
-def handle_notifications(slot, notifications, remove=False, aid=''):
-    processed = failed = 0
-    for index, seq in enumerate(sorted(item['seqNumber'] for item in notifications)):
-        state.update(step='notifications', current=index + 1, total=len(notifications))
+def handle_notifications(slot, notifications, remove=False, aid='', cancel=None):
+    processed = failed = pending = 0
+    items = sorted(item['seqNumber'] for item in notifications)
+    for index, seq in enumerate(items):
+        if cancel is not None and cancel():
+            pending = len(items) - index
+            break
+        state.update(step='notifications', current=index + 1, total=len(items))
         publish()
-        if notify(slot, seq, remove, aid)['ok']:
+        if notify(slot, seq, remove, aid, cancel=cancel)['ok']:
             processed += 1
         else:
             failed += 1
     state.update(processed=processed, failed=failed)
+    if pending:
+        state['pending'] = pending
 
 
-def report_new(slot, before, aid=''):
-    result = bridge.run_lpac(slot, ['notification', 'list'], aid=aid)
+def report_new(slot, before, aid='', cancel=None):
+    if cancel is None:
+        result = bridge.run_lpac(slot, ['notification', 'list'], aid=aid)
+    else:
+        result = bridge.run_lpac(slot, ['notification', 'list'], aid=aid, cancel=cancel)
     if not result['ok']:
         state['warning'] = 'notification_list'
         return
     seen = {item['seqNumber'] for item in before}
-    handle_notifications(slot, [item for item in result['data'] if item['seqNumber'] not in seen], aid=aid)
-    if state.get('failed'):
+    handle_notifications(slot, [item for item in result['data'] if item['seqNumber'] not in seen],
+                         aid=aid, cancel=cancel)
+    if state.get('failed') or state.get('pending'):
         state['warning'] = 'notification_report'
 
 
@@ -144,17 +205,17 @@ def download(slot, activation, confirmation, aid=''):
     argv = ['profile', 'download', '-p', '-a', activation]
     if confirmation:
         argv += ['-c', confirmation]
-    before = bridge.run_lpac(slot, ['notification', 'list'], aid=aid)
-    if cancelled:
-        return {'ok': False, 'error': 'cancelled', 'detail': ''}
+    before = bridge.run_lpac(slot, ['notification', 'list'], aid=aid, cancel=cancel_requested)
+    if cancel_requested():
+        return bridge.cancelled_result()
     if not before['ok']:
         return before
     result = bridge.run_lpac(slot, argv, on_progress=progress, on_preview=preview,
-                             cancel=lambda: cancelled, aid=aid)
+                             cancel=cancel_requested, aid=aid)
     if result['ok']:
         state['step'] = 'reporting'
         publish()
-        report_new(slot, before['data'], aid=aid)
+        report_new(slot, before['data'], aid=aid, cancel=cancel_requested)
     return result
 
 
@@ -178,12 +239,15 @@ def main(argv):
     except Exception as error:
         result = {'ok': False, 'error': 'lpac', 'detail': str(error)}
     state['data'] = result.get('data')
-    state['state'] = 'done' if result['ok'] else 'error'
+    state['state'] = 'done' if result['ok'] else (
+        'cancelled' if result['error'] == 'cancelled' else 'error')
     state['preview'] = False
     state['error'] = result['error']
     state['detail'] = result['detail']
     publish()
-    os.unlink(PIDFILE)
+    remove_cancel()
+    release_lock()
+    remove_pidfile()
     return 0
 
 
