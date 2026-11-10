@@ -8,6 +8,7 @@ var callNotifications = rpc.declare({ object: 'e5-esim', method: 'notifications'
 var callDownloadStart = rpc.declare({ object: 'e5-esim', method: 'download_start', params: [ 'slot', 'activation', 'confirmation', 'aid' ], nobatch: true });
 var callOperationStart = rpc.declare({ object: 'e5-esim', method: 'operation_start', params: [ 'slot', 'request', 'aid' ], nobatch: true });
 var callJobStatus = rpc.declare({ object: 'e5-esim', method: 'job_status', nobatch: true });
+var callDependencies = rpc.declare({ object: 'e5-esim', method: 'dependencies', nobatch: true });
 var callJobConfirm = rpc.declare({ object: 'e5-esim', method: 'job_confirm', params: [ 'accept' ], nobatch: true });
 var callJobCancel = rpc.declare({ object: 'e5-esim', method: 'job_cancel', nobatch: true });
 
@@ -37,6 +38,8 @@ var CSS = `
 .e5-esim .e5-progress-label{display:flex;justify-content:space-between;gap:12px}
 .e5-esim .e5-table-wrap{overflow-x:auto}
 .e5-esim .e5-id{overflow-wrap:anywhere;font-family:monospace}
+.e5-esim .e5-command{overflow-x:auto;margin:12px 0;padding:10px 12px;background:var(--background-color-low,rgba(127,127,127,.08));border-radius:4px}
+.e5-esim .e5-deps{margin:0;padding-left:20px}
 .e5-esim .e5-step{margin:0}
 .e5-esim .e5-actions .cbi-button{white-space:nowrap}
 `;
@@ -124,12 +127,14 @@ function bytes(n) {
 }
 
 function createPage(loaded) {
+	var deps = loaded && loaded.deps;
+	var job = loaded && loaded.job;
 	var state = {
 		view: 'loading', action: null, current: 0, pick: true,
 		iccid: '', name: '', enabled: false,
 		activation: '', confirmation: '',
 		downloading: false, cancelling: false,
-		metadata: null, seq: 0, disposed: false, resuming: false
+		metadata: null, seq: 0, disposed: false, resuming: false, deps: deps || null
 	};
 	var slots = [ newSlot(), newSlot() ];
 	var bulk = { total: 0, next: 0, remove: false, running: false };
@@ -208,6 +213,67 @@ function createPage(loaded) {
 		return E('h3', {}, text);
 	}
 
+	function dependencyItems() {
+		return ((state.deps && state.deps.items) || []).filter(function(item) { return !item.present; });
+	}
+
+	function dependencyMissing(name) {
+		return !!state.deps && (state.deps.missing || []).indexOf(name) >= 0;
+	}
+
+	function installCommand() {
+		var data = state.deps || {};
+		var packages = data.missing && data.missing.length ? data.missing : [ 'lpac', 'libcurl-gnutls4' ];
+		return 'apk update && apk add ' + packages.join(' ');
+	}
+
+	function softwareLink() {
+		var parts = [ 'admin', 'system', 'opkg' ];
+		var href = typeof L.url === 'function' ? L.url.apply(L, parts) : '/cgi-bin/luci/' + parts.join('/');
+		return E('a', { class: 'btn cbi-button', href: href }, tr('打开软件包管理', 'Open package manager'));
+	}
+
+	function dependencyCard() {
+		var missing = dependencyItems();
+		var blocking = dependencyMissing('lpac');
+		var nodes = [ E('div', { class: 'e5-toolbar' }, [ heading(tr('运行依赖', 'Runtime dependencies')),
+			E('div', { class: 'e5-actions' }, [
+				softwareLink(),
+				button(tr('重新检测', 'Check again'), 'apply', checkDependencies)
+			]) ]),
+			message(blocking
+				? tr('缺少 lpac，无法访问 eSIM。安装依赖后重新检测。', 'lpac is missing, so the eSIM cannot be accessed. Install the dependencies and check again.')
+				: tr('缺少 libcurl-gnutls4，配置文件下载可能失败；其他功能仍可使用。', 'libcurl-gnutls4 is missing; profile downloads may fail. Other functions still work.')) ];
+		if (missing.length)
+			nodes.push(E('ul', { class: 'e5-deps' }, missing.map(function(item) {
+				return E('li', {}, [ E('code', {}, item.package), ' ', item.path || '' ]);
+			})));
+		nodes.push(E('pre', { class: 'e5-command' }, installCommand()));
+		nodes.push(note(tr('安装后重新检测；也可在上面的软件包管理中安装。', 'Check again after installing, or use the package manager link above.')));
+		return card(nodes);
+	}
+
+	function checkDependencies() {
+		state.view = 'loading';
+		render();
+		callDependencies().then(function(result) {
+			if (state.disposed)
+				return;
+			state.deps = result && result.ok ? result.data : null;
+			if (dependencyMissing('lpac')) {
+				state.view = 'deps';
+				render();
+				return;
+			}
+			load();
+		}).catch(function() {
+			if (state.disposed)
+				return;
+			state.deps = null;
+			load();
+		});
+	}
+
 	function backCard() {
 		return E('div', { class: 'e5-actions' }, [ button(tr('返回', 'Back'), '', goRoot) ]);
 	}
@@ -256,6 +322,8 @@ function createPage(loaded) {
 			return [ message(tr('正在读取通知…', 'Reading notifications…')) ];
 		case 'root':
 			return rootNodes();
+		case 'deps':
+			return [ dependencyCard() ];
 		case 'download':
 			return downloadNodes();
 		case 'rename':
@@ -294,6 +362,8 @@ function createPage(loaded) {
 	function rootNodes() {
 		var slot = slots[state.current];
 		var nodes = [];
+		if (dependencyItems().length)
+			nodes.push(dependencyCard());
 		if (slot.ses) {
 			var choices = [];
 			SE_AIDS.forEach(function(aid, index) {
@@ -850,9 +920,11 @@ function createPage(loaded) {
 		startOperation({ action: 'notifications', notifications: slots[state.current].notifications || [], remove: remove });
 	}
 
-	var job = loaded || null;
-
-	if (job && job.running && job.type === 'download') {
+	if (dependencyMissing('lpac')) {
+		state.view = 'deps';
+		render();
+	}
+	else if (job && job.running && job.type === 'download') {
 		state.current = job.slot;
 		slots[state.current].aid = job.aid || '';
 		state.action = 'download';
@@ -888,11 +960,17 @@ function createPage(loaded) {
 
 return view.extend({
 	load: function() {
-		return callJobStatus().catch(function() { return null; });
+		return Promise.all([
+			callDependencies().catch(function() { return null; }),
+			callJobStatus().catch(function() { return null; })
+		]).then(function(results) {
+			var dependencies = results[0];
+			return { deps: dependencies && dependencies.ok ? dependencies.data : null, job: results[1] };
+		});
 	},
 
 	render: function(loaded) {
-		var page = createPage(loaded);
+		var page = createPage(loaded || {});
 		this.stop = page.stop;
 		return page.root;
 	},

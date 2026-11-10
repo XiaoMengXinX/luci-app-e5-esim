@@ -15,12 +15,22 @@ E5 设备的 LuCI eSIM 管理应用。菜单入口为“蜂窝 → eSIM 管理�
 - 激活码下载、可选确认码、运营商元数据预览、确认与取消。
 - 通知单条处理、单条删除、处理全部与全部删除。批量操作按序号升序执行，单条失败后继续。
 - 下载或删除配置文件后，仅上报本次操作新增的通知；上报失败会提示在通知页重试。
+- 打开页面时检查 `lpac` 与 `libcurl-gnutls4` 运行依赖；缺失时显示实际路径、安装命令和软件包管理入口，安装后可重新检测。
 
 启停、重命名、删除、批量通知和下载均由后台任务执行。刷新或关闭页面后，已经开始的操作继续执行；重新进入页面会接续显示正在运行的任务。
 
 ## 安装
 
 依赖为 `luci-base`、`rpcd`、`python3`、`lpac`、`libcurl-gnutls4`，安装本包时由包管理器一并装入。
+页面会检查两个外部运行组件：`/usr/lib/lpac` 必须存在且可执行，`/usr/lib/libcurl-gnutls.so.4` 必须存在且可读。
+缺失时页面列出缺少的包和实际路径；可按页面给出的命令安装，或打开 LuCI 软件包管理（`/admin/system/opkg`）安装：
+
+```sh
+apk update && apk add lpac libcurl-gnutls4
+```
+
+安装后回到页面点击“重新检测”。`luci-base`、`rpcd`、`python3` 由基础系统或本包依赖提供；
+`python3` 是 rpcd 脚本的运行环境，缺失时页面无法启动，因此不在页面内检测。
 
 将本目录放入 OpenWrt 构建树的 `package/luci-app-e5-esim`：
 
@@ -28,7 +38,7 @@ E5 设备的 LuCI eSIM 管理应用。菜单入口为“蜂窝 → eSIM 管理�
 make package/luci-app-e5-esim/compile
 ```
 
-也可在设备上从本目录直接部署：
+也可在设备上从本目录直接部署；直接复制不会安装依赖，需先确保上述两个运行组件存在：
 
 ```sh
 cp -r root/. /
@@ -61,10 +71,12 @@ rm -rf /tmp/luci-modulecache
 |---|---|
 | `root/usr/lib/e5-esim/bridge.py` | pty AT 桥、lpac 运行器、SIM 刷新 |
 | `root/usr/lib/e5-esim/job.py` | 后台操作、通知上报、下载确认 |
-| `root/usr/libexec/rpcd/e5-esim` | 参数校验、互斥、ubus RPC |
+| `root/usr/libexec/rpcd/e5-esim` | 参数校验、依赖检测、互斥、ubus RPC |
 | `htdocs/luci-static/resources/view/e5-esim.js` | LuCI 页面与任务显示 |
 
-ubus 对象为 `e5-esim`。读取方法为 `snapshot`、`profiles`、`notifications` 和 `job_status`。页面通过 `operation_start`、`download_start` 启动任务，通过 `job_confirm`、`job_cancel` 控制下载。底层 profile、notification 与 SIM 刷新方法也可通过 ubus 单独调用。
+ubus 对象为 `e5-esim`。读取方法为 `dependencies`、`snapshot`、`profiles`、`notifications` 和 `job_status`。
+`dependencies` 无参数，返回 `ready`、`missing`（缺失包名）以及 `lpac`、`libcurl-gnutls4` 的实际路径和存在状态；
+它只检查文件，不访问 AT 环，也不使用操作锁。页面通过 `operation_start`、`download_start` 启动任务，通过 `job_confirm`、`job_cancel` 控制下载。底层 profile、notification 与 SIM 刷新方法也可通过 ubus 单独调用。
 
 `snapshot` 参数为 `{slot, aid, scan}`；`aid` 为空或 SE 白名单 AID（`…442D522030` / `…442D522031`），
 `scan` 控制是否探测多 SE。探测结果以 `ses` 位掩码返回，`aid` 是最终选中的 ISD-R；
@@ -93,7 +105,7 @@ lpac 使用 `at` APDU 后端，设备路径指向 pty。桥接将 `CCHO`、`CGLA
 
 配置文件的 eUICC 状态和基带读取的 ICCID 是两个观测值。AT 刷新返回 OK 仅表示命令执行成功，不能据此断言基带身份已经更新。遇到状态不一致时应保留两侧信息与 APDU 应答，结合设备固件和 lpac 同版本源码诊断。
 
-本项目的回归测试使用模拟 AT、lpac 子进程和 LuCI RPC，覆盖通道恢复与重试、HTTP 等待取消、互斥、参数校验、切换刷新顺序、通知差集和部分失败继续、卡槽选择及启动期间取消：
+本项目的回归测试使用模拟 AT、lpac 子进程和 LuCI RPC，覆盖运行依赖检测、通道恢复与重试、HTTP 等待取消、互斥、参数校验、切换刷新顺序、通知差集和部分失败继续、卡槽选择及启动期间取消：
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v

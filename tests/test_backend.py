@@ -415,6 +415,35 @@ class BridgeFlows(unittest.TestCase):
                 bridge.run_lpac(0, ['chip', 'info'], aid=SE0)
                 self.assertEqual(output.read_text(), SE0)
 
+    def test_dependency_status_uses_bridge_artifact_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            lpac = work / 'lpac'
+            lpac.write_text('#!/bin/sh\n')
+            lpac.chmod(0o755)
+            library = work / 'libcurl-gnutls.so.4'
+            library.write_bytes(b'')
+            with patch.object(rpc.bridge, 'LPAC', str(lpac)), \
+                    patch.object(rpc.bridge, 'GNUTLS_CURL', str(library)):
+                result = rpc.dependencies({})
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['data']['ready'], True)
+        self.assertEqual(result['data']['missing'], [])
+        self.assertEqual([(item['package'], item['path'], item['present']) for item in result['data']['items']],
+                         [('lpac', str(lpac), True), ('libcurl-gnutls4', str(library), True)])
+
+    def test_dependency_status_reports_missing_or_unusable_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            lpac = work / 'lpac'
+            lpac.write_text('')
+            with patch.object(rpc.bridge, 'LPAC', str(lpac)), \
+                    patch.object(rpc.bridge, 'GNUTLS_CURL', str(work / 'missing.so')):
+                result = rpc.dependencies({})
+        self.assertFalse(result['data']['ready'])
+        self.assertEqual(result['data']['missing'], ['lpac', 'libcurl-gnutls4'])
+        self.assertEqual([item['present'] for item in result['data']['items']], [False, False])
+
     def test_integer_parameters_are_not_truncated(self):
         for value in (True, .5, '1', -1, 2):
             with self.assertRaises(rpc.Invalid):

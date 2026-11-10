@@ -49,7 +49,8 @@ function harness(respond) {
     let root;
     return {
         calls, api, get root() { return root; }, get modal() { return modal; },
-        async open(job = null) { root = api.render(job); await flush(); },
+        async open(job = null, deps = null) { root = api.render({ job, deps }); await flush(); },
+        async openViaLoad() { const loaded = await api.load(); root = api.render(loaded); await flush(); return loaded; },
         async click(text) {
             function find(node) {
                 if (!(node instanceof Node)) return null;
@@ -191,5 +192,46 @@ const snapshot = { ok: true, chip: good({ eidValue: 'EID' }), profiles: good(pro
     assert.equal(c.calls.filter(call => call[0] === 'job_confirm').length, 0);
     assert.ok(c.root.textContent.includes('Cancelling download'));
     c.api.unload();
-    console.log('Frontend flows passed: slot fallback/selection, multi-SE routing, switch sequence, cancel during launch.');
+    const depItems = [
+        { package: 'lpac', path: '/usr/lib/lpac', present: false },
+        { package: 'libcurl-gnutls4', path: '/usr/lib/libcurl-gnutls.so.4', present: true }
+    ];
+    let deps = { ok: true, data: { ready: false, missing: ['lpac'], items: depItems } };
+    const missing = harness(method => {
+        if (method === 'dependencies') return deps;
+        if (method === 'snapshot') return snapshot;
+        return good(null);
+    });
+    const loaded = await missing.openViaLoad();
+    assert.deepEqual(loaded.deps, deps.data);
+    assert.ok(missing.root.textContent.includes('lpac is missing'));
+    assert.ok(missing.root.textContent.includes('/usr/lib/lpac'));
+    assert.ok(missing.root.textContent.includes('apk update && apk add lpac'));
+    const depsLink = matching(missing.root, node => node.tag === 'a' && node.textContent === 'Open package manager');
+    assert.equal(depsLink[0].attrs.href, '/cgi-bin/luci/admin/system/opkg');
+    assert.equal(missing.calls.filter(call => call[0] === 'snapshot').length, 0);
+    deps = { ok: true, data: { ready: true, missing: [],
+        items: depItems.map(item => ({ ...item, present: true })) } };
+    const dependencyCalls = missing.calls.filter(call => call[0] === 'dependencies').length;
+    await missing.click('Check again');
+    assert.equal(missing.calls.filter(call => call[0] === 'dependencies').length, dependencyCalls + 1);
+    assert.ok(missing.root.textContent.includes('Test'));
+    missing.api.unload();
+
+    const partialDeps = { ok: true, data: { ready: false, missing: ['libcurl-gnutls4'], items: [
+        { package: 'lpac', path: '/usr/lib/lpac', present: true },
+        { package: 'libcurl-gnutls4', path: '/usr/lib/libcurl-gnutls.so.4', present: false }
+    ] } };
+    const partial = harness(method => {
+        if (method === 'dependencies') return partialDeps;
+        if (method === 'snapshot') return snapshot;
+        return good(null);
+    });
+    await partial.openViaLoad();
+    assert.ok(partial.root.textContent.includes('Test'));
+    assert.ok(partial.root.textContent.includes('apk update && apk add libcurl-gnutls4'));
+    partial.api.unload();
+
+    console.log('Frontend flows passed: slot fallback/selection, multi-SE routing, switch sequence, cancel during launch, dependency guidance.');
+
 })().catch(error => { console.error(error); process.exitCode = 1; });

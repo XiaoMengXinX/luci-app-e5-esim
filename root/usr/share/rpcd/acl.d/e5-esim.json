@@ -3,7 +3,7 @@
     "description": "Read and manage the eSIM profiles on both SIM slots",
     "read": {
       "ubus": {
-        "e5-esim": ["snapshot", "profiles", "notifications", "job_status"]
+        "e5-esim": ["dependencies", "snapshot", "profiles", "notifications", "job_status"]
       }
     },
     "write": {

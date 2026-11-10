@@ -21,6 +21,7 @@ EMPTY = {'type': None, 'state': None, 'step': None, 'preview': False, 'metadata'
          'error': None, 'detail': None}
 
 METHODS = {
+    'dependencies': {},
     'snapshot': {'slot': 0, 'aid': '', 'scan': True},
     'profiles': {'slot': 0, 'aid': ''},
     'notifications': {'slot': 0, 'aid': ''},
@@ -132,6 +133,16 @@ def alive():
     except (OSError, ValueError):
         return False
     return True
+
+
+def dependencies(params):
+    items = []
+    for package, path, mode in (('lpac', bridge.LPAC, os.X_OK),
+                                ('libcurl-gnutls4', bridge.GNUTLS_CURL, os.R_OK)):
+        present = os.path.isfile(path) and os.access(path, mode)
+        items.append({'package': package, 'path': path, 'present': present})
+    missing = [item['package'] for item in items if not item['present']]
+    return ok({'ready': not missing, 'missing': missing, 'items': items})
 
 
 def snapshot(params):
@@ -282,6 +293,7 @@ def job_cancel(params):
 
 
 HANDLERS = {
+    'dependencies': dependencies,
     'snapshot': snapshot,
     'profiles': profiles,
     'notifications': notifications,
